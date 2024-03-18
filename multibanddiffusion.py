@@ -11,15 +11,37 @@ Multi Band Diffusion models as described in
 """
 
 import typing as tp
+from pathlib import Path
+from encodec import EncodecModel
+
+import omegaconf
 
 import torch
 import julius
 
-from .unet import DiffusionUnet
-from ..modules.diffusion_schedule import NoiseSchedule
-from .encodec import CompressionModel
-from ..solvers.compression import CompressionSolver
-from .loaders import load_compression_model, load_diffusion_models
+from unet import DiffusionUnet
+from diffusion_schedule import NoiseSchedule, SampleProcessor, MultiBandProcessor
+
+
+mbd_file = '/home/ubuntu/.cache/huggingface/hub/models--facebook--multiband-diffusion/snapshots/62daf9743d37c54e13366e396241a476908ecad7/mbd_comp_8.pt'
+enc_file = '/home/ubuntu/encodec.cpp/ggml_weights/encodec_24khz-d7cc33bc.th'
+
+def get_diffusion_model(cfg: omegaconf.DictConfig):
+    # TODO Find a way to infer the channels from dset
+    channels = cfg.channels
+    num_steps = cfg.schedule.num_steps
+    return DiffusionUnet(
+            chin=channels, num_steps=num_steps, **cfg.diffusion_unet)
+
+def get_processor(cfg, sample_rate: int = 24000):
+    sample_processor = SampleProcessor()
+    if cfg.use:
+        kw = dict(cfg)
+        kw.pop('use')
+        kw.pop('name')
+        if cfg.name == "multi_band_processor":
+            sample_processor = MultiBandProcessor(sample_rate=sample_rate, **kw)
+    return sample_processor
 
 
 class DiffusionProcess:
@@ -52,7 +74,7 @@ class MultiBandDiffusion:
         DPs (list of DiffusionProcess): Diffusion processes.
         codec_model (CompressionModel): Underlying compression model used to obtain discrete tokens.
     """
-    def __init__(self, DPs: tp.List[DiffusionProcess], codec_model: CompressionModel) -> None:
+    def __init__(self, DPs: tp.List[DiffusionProcess], codec_model: EncodecModel) -> None:
         self.DPs = DPs
         self.codec_model = codec_model
         self.device = next(self.codec_model.parameters()).device
@@ -61,21 +83,29 @@ class MultiBandDiffusion:
     def sample_rate(self) -> int:
         return self.codec_model.sample_rate
 
+
     @staticmethod
-    def get_mbd_musicgen(device=None):
-        """Load our diffusion models trained for MusicGen."""
-        if device is None:
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        path = 'facebook/multiband-diffusion'
-        filename = 'mbd_musicgen_32khz.th'
-        name = 'facebook/musicgen-small'
-        codec_model = load_compression_model(name, device=device)
-        models, processors, cfgs = load_diffusion_models(path, filename=filename, device=device)
-        DPs = []
-        for i in range(len(models)):
-            schedule = NoiseSchedule(**cfgs[i].schedule, sample_processor=processors[i], device=device)
-            DPs.append(DiffusionProcess(model=models[i], noise_schedule=schedule))
-        return MultiBandDiffusion(DPs=DPs, codec_model=codec_model)
+    def load_diffusion_models(filename: tp.Union[Path, str],
+                            device='cpu'):
+        pkg = torch.load(filename, map_location=device)
+        models = []
+        processors = []
+        cfgs = []
+        sample_rate = pkg['sample_rate']
+        for i in range(pkg['n_bands']):
+            cfg = pkg[i]['cfg']
+            model = get_diffusion_model(cfg)
+            model_dict = pkg[i]['model_state']
+            model.load_state_dict(model_dict)
+            model.to(device)
+            processor = get_processor(cfg=cfg.processor, sample_rate=sample_rate)
+            processor_dict = pkg[i]['processor_state']
+            processor.load_state_dict(processor_dict)
+            processor.to(device)
+            models.append(model)
+            processors.append(processor)
+            cfgs.append(cfg)
+        return models, processors, cfgs
 
     @staticmethod
     def get_mbd_24khz(bw: float = 3.0,
@@ -96,13 +126,11 @@ class MultiBandDiffusion:
             assert {1.5: 2, 3.0: 4, 6.0: 8}[bw] == n_q, \
                 f"bandwidth and number of codebooks missmatch to use n_q = {n_q} bw should be {n_q * (1.5 / 2)}"
         n_q = {1.5: 2, 3.0: 4, 6.0: 8}[bw]
-        codec_model = CompressionSolver.model_from_checkpoint(
-            '//pretrained/facebook/encodec_24khz', device=device)
-        codec_model.set_num_codebooks(n_q)
-        codec_model = codec_model.to(device)
-        path = 'facebook/multiband-diffusion'
-        filename = f'mbd_comp_{n_q}.pt'
-        models, processors, cfgs = load_diffusion_models(path, filename=filename, device=device)
+
+        codec_model = EncodecModel.encodec_model_24khz().to(device)
+        codec_model.set_target_bandwidth(bw)
+        
+        models, processors, cfgs = MultiBandDiffusion.load_diffusion_models(filename=mbd_file, device=device)
         DPs = []
         for i in range(len(models)):
             schedule = NoiseSchedule(**cfgs[i].schedule, sample_processor=processors[i], device=device)
@@ -127,7 +155,7 @@ class MultiBandDiffusion:
         """Get latent representation from the discrete codes.
         Args:
             codes (torch.Tensor): Discrete tokens."""
-        emb = self.codec_model.decode_latent(codes)
+        emb = self.codec_model.quantizer.decode(codes.transpose(0, 1))
         return emb
 
     def generate(self, emb: torch.Tensor, size: tp.Optional[torch.Size] = None,

@@ -20,23 +20,16 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+#TODO: replace ops.unbind and ops.LowerTriangularMask with pure PyTorch equivalents
 from xformers import ops
 
-from .rope import RotaryEmbedding
-from .streaming import StreamingModule
-
-_efficient_attention_backend: str = 'torch'
-
-
-def set_efficient_attention_backend(backend: str = 'torch'):
-    # Using torch by default, it seems a bit faster on older P100 GPUs (~20% faster).
-    global _efficient_attention_backend
-    assert _efficient_attention_backend in ['xformers', 'torch']
-    _efficient_attention_backend = backend
+from rope import RotaryEmbedding
+from streaming import StreamingModule
 
 
 def _get_attention_time_dimension(memory_efficient: bool) -> int:
-    if _efficient_attention_backend == 'torch' and memory_efficient:
+    if memory_efficient:
         return 2
     else:
         return 1
@@ -93,7 +86,7 @@ def expand_repeated_kv(x: torch.Tensor, n_rep: int, memory_efficient: bool) -> t
     """torch.repeat_interleave(x, dim=2, repeats=n_rep) from xlformers."""
     if n_rep == 1:
         return x
-    if _efficient_attention_backend == 'torch' and memory_efficient:
+    if memory_efficient:
         bs, n_kv_heads, slen, head_dim = x.shape
         return (
             x[:, :, None, :, :]
@@ -186,9 +179,6 @@ class StreamingMultiheadAttention(StreamingModule):
         if cross_attention:
             assert not causal, "Causal cannot work with cross attention."
             assert rope is None, "Rope cannot work with cross attention."
-
-        if memory_efficient:
-            _verify_xformers_memory_efficient_compat()
 
         self.custom = _is_custom(custom, memory_efficient)
         if self.custom:
@@ -399,11 +389,8 @@ class StreamingMultiheadAttention(StreamingModule):
                 q, k, v = [x.float() for x in [q, k, v]]
             if self.memory_efficient:
                 p = self.dropout if self.training else 0
-                if _efficient_attention_backend == 'torch':
-                    x = torch.nn.functional.scaled_dot_product_attention(
-                        q, k, v, is_causal=attn_mask is not None, dropout_p=p)
-                else:
-                    x = ops.memory_efficient_attention(q, k, v, attn_mask, p=p)
+                x = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=attn_mask is not None, dropout_p=p)
             else:
                 # We include the dot product as float32, for consistency
                 # with the other implementations that include that step
@@ -628,9 +615,7 @@ class StreamingTransformer(StreamingModule):
 
         self.checkpointing = checkpointing
 
-        assert checkpointing in ['none', 'torch', 'xformers_default', 'xformers_mm']
-        if self.checkpointing.startswith('xformers'):
-            _verify_xformers_internal_compat()
+        assert checkpointing in ['none', 'torch']
 
         self.layers = nn.ModuleList()
         for idx in range(num_layers):
@@ -655,28 +640,6 @@ class StreamingTransformer(StreamingModule):
             return layer(*args, **kwargs)
         elif method == 'torch':
             return torch_checkpoint(layer, *args, use_reentrant=False, **kwargs)
-        elif method.startswith('xformers'):
-            from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy
-            if method == 'xformers_default':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "xformers.efficient_attention_forward_cutlass.default",
-                    "xformers_flash.flash_fwd.default",
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
-            elif method == 'xformers_mm':
-                # those operations will be saved, and not recomputed.
-                # According to Francisco we can get smarter policies but this is a good start.
-                allow_list = [
-                    "aten.addmm.default",
-                    "aten.mm.default",
-                ]
-            else:
-                raise ValueError(f"xformers checkpointing xformers policy {method} is not known.")
-            policy_fn = _get_default_policy(allow_list)
-            return checkpoint(layer, *args, policy_fn=policy_fn, **kwargs)
         else:
             raise ValueError(f"Checkpointing method {method} is unknown.")
 
@@ -709,36 +672,6 @@ class StreamingTransformer(StreamingModule):
         if self.weight_decay is not None:
             group["weight_decay"] = self.weight_decay
         return group
-
-
-# special attention related function
-
-def _verify_xformers_memory_efficient_compat():
-    try:
-        from xformers.ops import memory_efficient_attention, LowerTriangularMask  # noqa
-    except ImportError:
-        raise ImportError(
-            "xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
-
-
-def _verify_xformers_internal_compat():
-    try:
-        from xformers.checkpoint_fairinternal import checkpoint, _get_default_policy  # noqa
-    except ImportError:
-        raise ImportError(
-            "Francisco's fairinternal xformers is not installed. Please install it and try again.\n"
-            "To install on AWS and Azure, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='8.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n"
-            "To install on FAIR Cluster, run \n"
-            "FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST='6.0;7.0'\\\n"
-            "pip install -U git+https://git@github.com/fairinternal/xformers.git#egg=xformers\n")
 
 
 def _is_custom(custom: bool, memory_efficient: bool):

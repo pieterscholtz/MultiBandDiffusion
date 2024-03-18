@@ -14,21 +14,11 @@ import typing as tp
 import torch
 from torch import nn
 from torch.nn import functional as F
-from audiocraft.modules.transformer import StreamingTransformer, create_sin_embedding
-
+from transformer import StreamingTransformer, create_sin_embedding
 
 @dataclass
 class Output:
     sample: torch.Tensor
-
-
-def get_model(cfg, channels: int, side: int, num_steps: int):
-    if cfg.model == 'unet':
-        return DiffusionUnet(
-            chin=channels, num_steps=num_steps, **cfg.diffusion_unet)
-    else:
-        raise RuntimeError('Not Implemented')
-
 
 class ResBlock(nn.Module):
     def __init__(self, channels: int, kernel: int = 3, norm_groups: int = 4,

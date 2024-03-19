@@ -12,19 +12,16 @@ Multi Band Diffusion models as described in
 
 import typing as tp
 from pathlib import Path
-from encodec import EncodecModel
-
-import omegaconf
 
 import torch
-import julius
 
+import omegaconf
+import julius
+from huggingface_hub import hf_hub_download
+
+from encodec import EncodecModel
 from unet import DiffusionUnet
 from diffusion_schedule import NoiseSchedule, SampleProcessor, MultiBandProcessor
-
-
-mbd_file = '/home/ubuntu/.cache/huggingface/hub/models--facebook--multiband-diffusion/snapshots/62daf9743d37c54e13366e396241a476908ecad7/mbd_comp_8.pt'
-enc_file = '/home/ubuntu/encodec.cpp/ggml_weights/encodec_24khz-d7cc33bc.th'
 
 def get_diffusion_model(cfg: omegaconf.DictConfig):
     # TODO Find a way to infer the channels from dset
@@ -42,6 +39,57 @@ def get_processor(cfg, sample_rate: int = 24000):
         if cfg.name == "multi_band_processor":
             sample_processor = MultiBandProcessor(sample_rate=sample_rate, **kw)
     return sample_processor
+
+def load_mbd_checkpoint(file_or_url_or_id: tp.Union[Path, str],
+                        filename: tp.Optional[str] = None,
+                        device: str = 'cpu',
+                        cache_dir: tp.Optional[str] = None):
+    # Return the state dict either from a file or url
+    if isinstance(file_or_url_or_id, Path):
+        file_or_url_or_id = str(file_or_url_or_id)
+    assert isinstance(file_or_url_or_id, str)
+
+    if Path(file_or_url_or_id).is_file():
+        return torch.load(file_or_url_or_id, map_location=device)
+
+    if Path(file_or_url_or_id).is_dir():
+        file = Path(file_or_url_or_id) / filename
+        return torch.load(str(file), map_location=device)
+
+    if file_or_url_or_id.startswith('https://'):
+        return torch.hub.load_state_dict_from_url(file_or_url_or_id, map_location=device, check_hash=True)
+
+    assert filename is not None, "filename needs to be defined if using HF checkpoints"
+    file = hf_hub_download(
+        repo_id=file_or_url_or_id, filename=filename, cache_dir=cache_dir,
+        library_name='audiocraft', library_version='1.2.0')
+    return torch.load(file, map_location=device)
+
+
+def load_diffusion_models(file_or_url_or_id: tp.Union[Path, str],
+                          device='cpu',
+                          filename: tp.Optional[str] = None,
+                          cache_dir: tp.Optional[str] = None):
+    # load checkpoint from cache or huggingface hub
+    pkg = load_mbd_checkpoint(file_or_url_or_id, filename, cache_dir)
+    models = []
+    processors = []
+    cfgs = []
+    sample_rate = pkg['sample_rate']
+    for i in range(pkg['n_bands']):
+        cfg = pkg[i]['cfg']
+        model = get_diffusion_model(cfg)
+        model_dict = pkg[i]['model_state']
+        model.load_state_dict(model_dict)
+        model.to(device)
+        processor = get_processor(cfg=cfg.processor, sample_rate=sample_rate)
+        processor_dict = pkg[i]['processor_state']
+        processor.load_state_dict(processor_dict)
+        processor.to(device)
+        models.append(model)
+        processors.append(processor)
+        cfgs.append(cfg)
+    return models, processors, cfgs
 
 
 class DiffusionProcess:
@@ -85,52 +133,26 @@ class MultiBandDiffusion:
 
 
     @staticmethod
-    def load_diffusion_models(filename: tp.Union[Path, str],
-                            device='cpu'):
-        pkg = torch.load(filename, map_location=device)
-        models = []
-        processors = []
-        cfgs = []
-        sample_rate = pkg['sample_rate']
-        for i in range(pkg['n_bands']):
-            cfg = pkg[i]['cfg']
-            model = get_diffusion_model(cfg)
-            model_dict = pkg[i]['model_state']
-            model.load_state_dict(model_dict)
-            model.to(device)
-            processor = get_processor(cfg=cfg.processor, sample_rate=sample_rate)
-            processor_dict = pkg[i]['processor_state']
-            processor.load_state_dict(processor_dict)
-            processor.to(device)
-            models.append(model)
-            processors.append(processor)
-            cfgs.append(cfg)
-        return models, processors, cfgs
-
-    @staticmethod
-    def get_mbd_24khz(bw: float = 3.0,
-                      device: tp.Optional[tp.Union[torch.device, str]] = None,
-                      n_q: tp.Optional[int] = None):
+    def get_mbd_24khz(device: tp.Optional[tp.Union[torch.device, str]] = None):
         """Get the pretrained Models for MultibandDiffusion.
 
         Args:
-            bw (float): Bandwidth of the compression model.
+            checkpoint_name (str): Name of the MBD model checkpoint.
             device (torch.device or str, optional): Device on which the models are loaded.
-            n_q (int, optional): Number of quantizers to use within the compression model.
         """
+        bw = 6.0
+        assert bw in [1.5, 3.0, 6.0], f"bandwidth {bw} not available"
+        n_q = {1.5: 2, 3.0: 4, 6.0: 8}[bw]
+        assert n_q in [2, 4, 8]
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        assert bw in [1.5, 3.0, 6.0], f"bandwidth {bw} not available"
-        if n_q is not None:
-            assert n_q in [2, 4, 8]
-            assert {1.5: 2, 3.0: 4, 6.0: 8}[bw] == n_q, \
-                f"bandwidth and number of codebooks missmatch to use n_q = {n_q} bw should be {n_q * (1.5 / 2)}"
-        n_q = {1.5: 2, 3.0: 4, 6.0: 8}[bw]
 
         codec_model = EncodecModel.encodec_model_24khz().to(device)
         codec_model.set_target_bandwidth(bw)
-        
-        models, processors, cfgs = MultiBandDiffusion.load_diffusion_models(filename=mbd_file, device=device)
+
+        path = 'facebook/multiband-diffusion'
+        filename = f'mbd_comp_{n_q}.pt'
+        models, processors, cfgs = load_diffusion_models(path, filename=filename, device=device)
         DPs = []
         for i in range(len(models)):
             schedule = NoiseSchedule(**cfgs[i].schedule, sample_processor=processors[i], device=device)

@@ -1,18 +1,7 @@
 dependencies = ['torch', 'torchaudio', 'numpy', 'einops', 'encodec', 'omegaconf', 'julius', 'huggingface_hub']
 
-import typing as tp
-from pathlib import Path
-from encodec import EncodecModel
-
-import omegaconf
-
 import torch
-import torchaudio
-import julius
-
 from multibanddiffusion import MultiBandDiffusion
-from unet import DiffusionUnet
-from diffusion_schedule import NoiseSchedule, SampleProcessor, MultiBandProcessor
 
 
 def mbd(output_sr=24000, bandwidth=6.0, device=None) -> MultiBandDiffusion:

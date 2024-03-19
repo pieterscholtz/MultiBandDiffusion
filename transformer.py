@@ -21,8 +21,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+# NB: the DiffusionUnet models do not use Transformers so we currently have no need
+# to include the xformers dependencies
 #TODO: replace ops.unbind and ops.LowerTriangularMask with pure PyTorch equivalents
-from xformers import ops
+# from xformers import ops
 
 from rope import RotaryEmbedding
 from streaming import StreamingModule
@@ -37,11 +39,7 @@ def _get_attention_time_dimension(memory_efficient: bool) -> int:
 
 def _is_profiled() -> bool:
     # Return true if we are currently running with a xformers profiler activated.
-    try:
-        from xformers.profiler import profiler
-    except ImportError:
-        return False
-    return profiler._Profiler._CURRENT_PROFILER is not None
+    return False
 
 
 def create_norm_fn(norm_type: str, dim: int, **kwargs) -> nn.Module:
@@ -226,6 +224,7 @@ class StreamingMultiheadAttention(StreamingModule):
         # convention both in the builtin MHA in Pytorch, and Xformers functions.
         time_dim = _get_attention_time_dimension(self.memory_efficient)
         if self.memory_efficient:
+            raise NotImplementedError("Memory efficient attention using xformers not currently available")
             from xformers.ops import LowerTriangularMask
             if current_steps == 1:
                 # If we only have one step, then we do not need a mask.
@@ -359,6 +358,7 @@ class StreamingMultiheadAttention(StreamingModule):
                     else:
                         bound_layout = "b t p h d"
                     packed = rearrange(projected, f"b t (p h d) -> {bound_layout}", p=3, h=self.num_heads)
+                    raise NotImplementedError("xformers.ops not currently available")
                     q, k, v = ops.unbind(packed, dim=2)
                 else:
                     embed_dim = self.embed_dim

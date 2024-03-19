@@ -21,24 +21,26 @@ def mbd(output_sr=24000, bandwidth=6.0, device=None) -> MultiBandDiffusion:
     Example usage:
     ```python
     device = torch.device('cuda')
-    model = torch.hub.load('pieterscholtz/MultiBandDiffusion', output_sr=24000, bandwidth=6.0, device=device)
+    model = torch.hub.load('pieterscholtz/MultiBandDiffusion', 'mbd', output_sr=24000, bandwidth=6.0, device=device)
 
     # Input audio file
+    file = 'test/ex04_default_00364.wav'
     waveform, sample_rate = torchaudio.load(file)
-    waveform = waveform.to('cuda')
+    assert sample_rate == model.sample_rate, f'sample rate of {sample_rate} Hz is not supported'
+    waveform.unsqueeze_(0)
+    waveform = waveform.to(device)
 
-    # Extract tokens
-    tokens = model.codec_model.encode(waveform)
-    tokens = tokens[0][0][0].detach()
-
-    # Convert to continuous latent space
-    condition = model.get_emb(tokens.unsqueeze(0))
-
-    # Convert to waveform
-    with torch.no_grad():
+    with torch.inference_mode():
+        # Extract tokens
+        tokens = model.codec_model.encode(waveform)
+        tokens = tokens[0][0]
+        # Convert to continuous latent space
+        condition = model.get_emb(tokens)
+        # Convert to waveform
         wav_diffusion = model.generate(emb=condition)
-    
-    torchaudio.save('out.wav;, wav_diffusion.squeeze(0).cpu(), 24000)
+
+    out_wav = Path(file).with_suffix('.mbd.wav')
+    torchaudio.save(out_wav, wav_diffusion.squeeze(0).cpu(), model.sample_rate)
     ```
     """
     assert output_sr in [24000], "output_sr argument must be 24000."

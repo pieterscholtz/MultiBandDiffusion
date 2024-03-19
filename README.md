@@ -6,21 +6,22 @@
 ```python
     from multibanddiffusion import MultiBandDiffusion
     import torchaudio
-    
-    model = MultiBandDiffusion.get_mbd_24khz(bw=6.0)
-    
-    file = '/home/ubuntu/metavoice-src/inputs/commentary2.24kHz.wav'
+
+    device = torch.device('cuda')
+    model = MultiBandDiffusion.get_mbd_24khz(device)
+
+    file = 'test/ex04_default_00364.wav'
     waveform, sample_rate = torchaudio.load(file)
-    waveform = waveform.to('cuda')
-    
-    tokens = model.codec_model.encode(waveform)
-    tokens = tokens[0][0][0].detach()
-    
-    condition = model.get_emb(tokens.unsqueeze(0))
-    
-    with torch.no_grad():
+    assert sample_rate == model.sample_rate, f'sample rate of {sample_rate} Hz is not supported'
+    waveform.unsqueeze_(0)
+    waveform = waveform.to(device)
+
+    with torch.inference_mode():
+        tokens = model.codec_model.encode(waveform)
+        tokens = tokens[0][0]
+        condition = model.get_emb(tokens)
         wav_diffusion = model.generate(emb=condition)
-    
-    out_wav = Path('.', Path('temp.wav').name)
-    torchaudio.save(out_wav, wav_diffusion.squeeze(0).cpu(), 24000)
+
+    out_wav = Path(file).with_suffix('.mbd.wav')
+    torchaudio.save(out_wav, wav_diffusion.squeeze(0).cpu(), model.sample_rate)
 ```

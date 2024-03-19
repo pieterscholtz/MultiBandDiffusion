@@ -1,0 +1,8 @@
+torch
+torchaudio
+numpy
+einops
+encodec
+omegaconf
+julius
+huggingface_hub

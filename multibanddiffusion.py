@@ -71,7 +71,7 @@ def load_diffusion_models(file_or_url_or_id: tp.Union[Path, str],
                           filename: tp.Optional[str] = None,
                           cache_dir: tp.Optional[str] = None):
     # load checkpoint from cache or huggingface hub
-    pkg = load_mbd_checkpoint(file_or_url_or_id, filename, cache_dir)
+    pkg = load_mbd_checkpoint(file_or_url_or_id, filename, device, cache_dir)
     models = []
     processors = []
     cfgs = []
